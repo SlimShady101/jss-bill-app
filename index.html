@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="theme-color" content="#1a3a5c"/>
+<title>JSS Air Express</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body,#root{height:100%;background:#f0f2f5}
+body{font-family:'Segoe UI',Arial,sans-serif;font-size:15px;color:#1a1a2e;overscroll-behavior:none}
+input,button,textarea,select{font-family:inherit}
+input[type=date]{-webkit-appearance:none;appearance:none}
+::-webkit-scrollbar{display:none}
+button:active{opacity:0.75}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect } = React;
+const XL = window.XLSX;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const STORAGE_KEY = "jss-app-v4";
+const MODES = ["AIR","OTC","F/T","S/P"];
+const DEFAULT_PARTIES = [
+  {id:"p1",name:"RJ Lumen",          address:"",gstin:"",phone:"",fuelPct:15,cgstPct:9,sgstPct:9},
+  {id:"p2",name:"Southern Surgicals",address:"",gstin:"",phone:"",fuelPct:15,cgstPct:9,sgstPct:9},
+  {id:"p3",name:"Bookita",           address:"",gstin:"",phone:"",fuelPct:15,cgstPct:9,sgstPct:9},
+];
+const EMPTY_ENTRY = {date:"",awb:"",kg:"",mode:"AIR",destination:"",clientName:"",price:""};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const todayStr   = () => new Date().toISOString().split("T")[0];
+const uid        = () => `${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+const fmtINR     = (n) => Number(n||0).toLocaleString("en-IN");
+const monthOf    = (d) => (d||todayStr()).slice(0,7);
+const monthLabel = (k) => { const [y,m]=k.split("-"); return new Date(y,m-1,1).toLocaleString("en-IN",{month:"long",year:"numeric"}); };
+const excelDate  = (s) => { if(!s)return""; const d=new Date(s),e=new Date(1899,11,30); return Math.floor((d-e)/86400000); };
+const fmtDate    = (s) => { if(!s)return""; return new Date(s).toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"}); };
+
+// FIX 4: capitalize first letter of each word helper
+const capitalizeFirst = (str) => {
+  if(!str) return str;
+  return str.charAt(0).toUpperCase() + str.slice(1);
+};
+
+const calcTotals = (entries, party) => {
+  const fuelPct = Number(party?.fuelPct ?? 15) / 100;
+  const cgstPct = Number(party?.cgstPct ?? 9)  / 100;
+  const sgstPct = Number(party?.sgstPct ?? 9)  / 100;
+  const gross = entries.reduce((s,e)=>s+Number(e.price||0),0);
+  const fuel  = gross * fuelPct;
+  const ts    = gross + fuel;
+  const cgst  = ts * cgstPct;
+  const sgst  = ts * sgstPct;
+  const net   = ts + cgst + sgst;
+  return {gross,fuel,ts,cgst,sgst,net,fuelPct,cgstPct,sgstPct};
+};
+
+// ── localStorage DB ───────────────────────────────────────────────────────────
+function useDB() {
+  const [parties, setPartiesState] = useState(null);
+  const [bills,   setBillsState]   = useState(null);
+  const [loaded,  setLoaded]       = useState(false);
+
+  useEffect(()=>{
+    try {
+      const raw  = localStorage.getItem(STORAGE_KEY);
+      const data = raw ? JSON.parse(raw) : null;
+      const pts  = (data?.parties || DEFAULT_PARTIES).map(p=>({
+        fuelPct:15, cgstPct:9, sgstPct:9, ...p
+      }));
+      setPartiesState(pts);
+      setBillsState(data?.bills || []);
+    } catch {
+      setPartiesState(DEFAULT_PARTIES);
+      setBillsState([]);
+    }
+    setLoaded(true);
+  },[]);
+
+  const save = (p,b) => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify({parties:p,bills:b})); }
+    catch(e){ console.error(e); }
+  };
+
+  const setParties = fn => setPartiesState(prev=>{
+    const next = typeof fn==="function" ? fn(prev) : fn;
+    setBillsState(b=>{ save(next,b); return b; });
+    return next;
+  });
+  const setBills = fn => setBillsState(prev=>{
+    const next = typeof fn==="function" ? fn(prev) : fn;
+    setPartiesState(p=>{ save(p,next); return p; });
+    return next;
+  });
+
+  return {parties,bills,setParties,setBills,loaded};
+}
+
+// ── Excel Export ──────────────────────────────────────────────────────────────
+function exportExcel(party, bill, entries) {
+  const wb=XL.utils.book_new(), ws={};
+  const sc=(r,c)=>XL.utils.encode_cell({r,c});
+  const set=(r,c,v,t="s")=>{ ws[sc(r,c)]={v,t}; };
+  ws["!merges"]=[];
+  const mg=(rs,re,cs,ce)=>ws["!merges"].push({s:{r:rs,c:cs},e:{r:re,c:ce}});
+
+  set(0,0,"JSS AIR EXPRESS"); mg(0,0,0,7);
+  set(1,0,"Franchise- JSS Air Express, Shop no.-8, Opp to Powerlink Complex, Thanisandra main road Bangalore-560077"); mg(1,1,0,7);
+  set(2,0,"Phone: 7975609737, 8884261970, 8431988489     Gmail: jssairexpress@gmail.com     GST No.-29CTCPD9755Q1ZS"); mg(2,2,0,7);
+  set(4,0,"Party Names"); set(4,1,party.name); mg(4,4,1,4);
+  set(4,5,"Bill no"); set(4,6,"2026/"+bill.billNo);
+  set(5,0,"Party Address:-"); set(5,1,party.address||""); mg(5,5,1,4);
+  set(5,5,"Bill date");
+  if(bill.billDate) ws[sc(5,6)]={v:excelDate(bill.billDate),t:"n",z:"dd-mmm-yy"};
+  set(6,5,"S.Tax category :Courier"); set(7,5,"Type of service :Courier");
+  set(8,0,"GSTI:"); set(8,1,party.gstin||""); set(8,5,"GSTIN: 29CTCPD9755Q1ZS");
+  set(9,0,"Ph No:"); set(9,1,party.phone||""); set(9,5,"P.A.N.No.");
+  ["S.NO","DATE","AWB NO","KG","MODE","DESTINATION","PARTY NAME","AMT"].forEach((h,i)=>set(11,i,h));
+  entries.forEach((e,i)=>{
+    const r=12+i;
+    set(r,0,i+1,"n");
+    if(e.date) ws[sc(r,1)]={v:excelDate(e.date),t:"n",z:"dd-mmm-yy"}; else set(r,1,"");
+    set(r,2,e.awb); set(r,3,e.kg?Number(e.kg):"",e.kg?"n":"s");
+    set(r,4,e.mode); set(r,5,e.destination); set(r,6,e.clientName);
+    set(r,7,e.price?Number(e.price):"",e.price?"n":"s");
+  });
+  const lr=12+entries.length;
+  const {gross,fuel,ts,cgst,sgst,net,fuelPct,cgstPct,sgstPct}=calcTotals(entries,party);
+  set(lr,0,"BANK DETAILS"); set(lr,5,"Gross total"); set(lr,6,+gross.toFixed(2),"n");
+  if(fuelPct>0){ set(lr+1,0,"NAME- JSS AIR EXPRESS"); set(lr+1,5,(fuelPct*100)+"% fuel charges:"); set(lr+1,6,+fuel.toFixed(2),"n"); }
+  else set(lr+1,0,"NAME- JSS AIR EXPRESS");
+  set(lr+2,0,"A/C NO.- 1048111010000065"); set(lr+2,5,"Total value of supply"); set(lr+2,6,+ts.toFixed(2),"n");
+  set(lr+3,0,"IFSC CODE-KSCB0001048");
+  if(cgstPct>0){ set(lr+3,5,(cgstPct*100)+"% CGST"); set(lr+3,6,+cgst.toFixed(2),"n"); }
+  set(lr+4,0,"BRANCH- THANISANDRA");
+  if(sgstPct>0){ set(lr+4,5,(sgstPct*100)+"% SGST"); set(lr+4,6,+sgst.toFixed(2),"n"); }
+  set(lr+5,5,"NET AMOUNT"); set(lr+5,6,+net.toFixed(2),"n");
+  set(lr+7,5,"for, JSS AIR EXPRESS"); set(lr+9,5,"Authorised signature");
+  ws["!cols"]=[6,12,12,5,8,14,16,10].map(w=>({wch:w}));
+  ws["!ref"]=XL.utils.encode_range({s:{r:0,c:0},e:{r:lr+10,c:7}});
+  XL.utils.book_append_sheet(wb,ws,"Bill");
+  XL.writeFile(wb,"JSS_"+party.name.replace(/\s+/g,"_")+"_Bill"+bill.billNo+".xlsx");
+}
+
+// ── PDF Share ─────────────────────────────────────────────────────────────────
+function buildBillHTML(party, bill, entries) {
+  const {gross,fuel,ts,cgst,sgst,net,fuelPct,cgstPct,sgstPct}=calcTotals(entries,party);
+  const f2=n=>Number(n||0).toLocaleString("en-IN",{minimumFractionDigits:2,maximumFractionDigits:2});
+  const rows=entries.map((e,i)=>
+    `<tr><td class="c">${i+1}</td><td>${fmtDate(e.date)}</td><td>${e.awb}</td>
+    <td class="c">${e.kg||""}</td><td class="c">${e.mode}</td>
+    <td>${e.destination}</td><td>${e.clientName||""}</td>
+    <td class="r">&#x20B9;${Number(e.price||0).toLocaleString("en-IN")}</td></tr>`
+  ).join("");
+  const taxRows = [
+    fuelPct>0 ? `<div class="trow"><span class="tl">${fuelPct*100}% Fuel Charges</span><span class="tv">&#x20B9;${f2(fuel)}</span></div>` : "",
+    `<div class="trow"><span class="tl">Total Value of Supply</span><span class="tv">&#x20B9;${f2(ts)}</span></div>`,
+    cgstPct>0 ? `<div class="trow"><span class="tl">${cgstPct*100}% CGST</span><span class="tv">&#x20B9;${f2(cgst)}</span></div>` : "",
+    sgstPct>0 ? `<div class="trow"><span class="tl">${sgstPct*100}% SGST</span><span class="tv">&#x20B9;${f2(sgst)}</span></div>` : "",
+  ].join("");
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JSS Bill #${bill.billNo}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Arial,sans-serif;font-size:8.5pt;padding:8mm;color:#111;background:#fff}
+.hd{text-align:center;margin-bottom:5px}
+.hd h1{font-size:16pt;font-weight:900;letter-spacing:2px;color:#1a3a5c}
+.hd p{font-size:7pt;color:#555;margin:2px 0}
+.bar{height:3px;background:#1a3a5c;margin:5px 0}
+.bar2{height:1px;background:#ccc;margin:5px 0}
+.meta{display:grid;grid-template-columns:1fr 1fr;gap:3px 16px;font-size:7.5pt;margin:5px 0}
+.mr{display:flex;gap:4px}.ml{font-weight:700;color:#333;white-space:nowrap}
+table{width:100%;border-collapse:collapse;margin:4px 0;font-size:7.5pt}
+th{background:#1a3a5c;color:#fff;padding:4px 3px;font-weight:700;font-size:7pt}
+th.r,td.r{text-align:right}th.c,td.c{text-align:center}
+td{padding:3.5px 3px;border-bottom:1px solid #eee}
+tr:nth-child(even) td{background:#f5f8fc}
+.totals{margin-left:auto;width:250px;font-size:8pt;margin-top:5px}
+.trow{display:flex;justify-content:space-between;padding:2px 0}
+.tl{color:#555}.tv{font-weight:600}
+.tnet{border-top:2px solid #1a3a5c;margin-top:4px;padding-top:4px}
+.tnet .tl,.tnet .tv{font-weight:800;font-size:10pt;color:#1a3a5c}
+.foot{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;font-size:7.5pt}
+.bank p{margin:1.5px 0}.bank b{display:block;margin-bottom:3px}
+.sig{text-align:right;padding-top:32px;font-weight:700}
+@page{size:A4 portrait;margin:0}
+@media print{body{padding:8mm}*{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style></head><body>
+<div class="hd">
+  <h1>JSS AIR EXPRESS</h1>
+  <p>Franchise- JSS Air Express, Shop no.-8, Opp to Powerlink Complex, Thanisandra main road Bangalore-560077</p>
+  <p>Phone: 7975609737, 8884261970, 8431988489 | Gmail: jssairexpress@gmail.com | GST No.: 29CTCPD9755Q1ZS</p>
+</div>
+<div class="bar"></div>
+<div class="meta">
+  <div class="mr"><span class="ml">Party:</span><span>${party.name}</span></div>
+  <div class="mr"><span class="ml">Bill No:</span><span>2026/${bill.billNo}</span></div>
+  <div class="mr"><span class="ml">Address:</span><span>${party.address||"—"}</span></div>
+  <div class="mr"><span class="ml">Bill Date:</span><span>${fmtDate(bill.billDate)}</span></div>
+  <div class="mr"><span class="ml">GSTIN:</span><span>${party.gstin||"—"}</span></div>
+  <div class="mr"><span class="ml">S.Tax Cat.:</span><span>Courier</span></div>
+  <div class="mr"><span class="ml">Ph:</span><span>${party.phone||"—"}</span></div>
+  <div class="mr"><span class="ml">Service:</span><span>Courier</span></div>
+</div>
+<div class="bar"></div>
+<table>
+<thead><tr><th class="c">S.No</th><th>Date</th><th>AWB No</th><th class="c">KG</th><th class="c">Mode</th><th>Destination</th><th>Client Name</th><th class="r">Amt</th></tr></thead>
+<tbody>${rows}</tbody>
+</table>
+<div class="bar2"></div>
+<div class="totals">
+  <div class="trow"><span class="tl">Gross Total</span><span class="tv">&#x20B9;${f2(gross)}</span></div>
+  ${taxRows}
+  <div class="trow tnet"><span class="tl">NET AMOUNT</span><span class="tv">&#x20B9;${f2(net)}</span></div>
+</div>
+<div class="bar2"></div>
+<div class="foot">
+  <div class="bank"><b>BANK DETAILS</b>
+    <p>Name: JSS AIR EXPRESS</p><p>A/C No.: 1048111010000065</p>
+    <p>IFSC: KSCB0001048</p><p>Branch: THANISANDRA</p>
+  </div>
+  <div class="sig">for, JSS AIR EXPRESS<br><br><br>Authorised Signature</div>
+</div>
+</body></html>`;
+}
+
+async function sharePDF(party, bill, entries, setStatus) {
+  const html     = buildBillHTML(party,bill,entries);
+  const fileName = "JSS_Bill_"+bill.billNo+"_"+party.name.replace(/\s+/g,"_")+".html";
+  const blob     = new Blob([html],{type:"text/html"});
+  if(navigator.share){
+    const file = new File([blob],fileName,{type:"text/html"});
+    if(navigator.canShare && navigator.canShare({files:[file]})){
+      try{ await navigator.share({files:[file],title:"JSS Bill #"+bill.billNo+" — "+party.name}); return; }
+      catch(e){ if(e.name==="AbortError") return; }
+    }
+    try{
+      const url=URL.createObjectURL(blob);
+      await navigator.share({title:"JSS Bill #"+bill.billNo,url});
+      setTimeout(()=>URL.revokeObjectURL(url),60000); return;
+    } catch(e){ if(e.name==="AbortError") return; }
+  }
+  const url=URL.createObjectURL(blob);
+  const win=window.open(url,"_blank");
+  setStatus("tip"); setTimeout(()=>{ URL.revokeObjectURL(url); setStatus(null); },30000);
+  if(!win){ const a=document.createElement("a"); a.href=url; a.download=fileName; a.click(); setStatus(null); }
+}
+
+// ── Download PDF (opens print dialog in new tab) ──────────────────────────────
+function downloadPDF(party, bill, entries) {
+  const html = buildBillHTML(party, bill, entries);
+  // Inject auto-print script so the tab immediately opens the print/save-as-PDF dialog
+  const printHtml = html.replace("</body>", "<script>window.onload=function(){window.print();}<\/script></body>");
+  const blob = new Blob([printHtml], {type:"text/html"});
+  const url  = URL.createObjectURL(blob);
+  const win  = window.open(url, "_blank");
+  setTimeout(()=>URL.revokeObjectURL(url), 60000);
+  if(!win){
+    // fallback: direct download as .html
+    const a=document.createElement("a");
+    a.href=url; a.download="JSS_Bill_"+bill.billNo+"_"+party.name.replace(/\s+/g,"_")+".html";
+    a.click();
+  }
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  const {parties,bills,setParties,setBills,loaded}=useDB();
+  // screens: home | billList | entry | parties | allBills
+  const [screen,       setScreen]       = useState("home");
+  const [focusPartyId, setFocusPartyId] = useState(null);
+  const [activeBillId, setActiveBillId] = useState(null);
+  const [showNewBill,  setShowNewBill]  = useState(false);
+  const [newBillForm,  setNewBillForm]  = useState({billNo:"",billDate:todayStr()});
+  const [entryForm,    setEntryForm]    = useState(EMPTY_ENTRY);
+  const [editEntryId,  setEditEntryId]  = useState(null);
+  const [entryTab,     setEntryTab]     = useState("add");
+  const [savedFlash,   setSavedFlash]   = useState("");
+  const [editPartyId,  setEditPartyId]  = useState(null);
+  const [shareStatus,  setShareStatus]  = useState(null);
+  const [showActions,  setShowActions]  = useState(false);
+  const [showAddParty, setShowAddParty] = useState(false);
+  const [newPartyName, setNewPartyName] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null); // {type:"bill"|"entry", id, label}
+
+  const activeBill    = bills?.find(b=>b.id===activeBillId)||null;
+  const activeParty   = activeBill ? parties?.find(p=>p.id===activeBill.partyId) : null;
+  const activeEntries = activeBill?.entries||[];
+  const totals        = calcTotals(activeEntries, activeParty);
+  const focusParty    = parties?.find(p=>p.id===focusPartyId)||null;
+
+  // FIX 1: sorted bills for the focused party — used for navigation
+  const focusBills = (bills||[])
+    .filter(b=>b.partyId===focusPartyId)
+    .sort((a,b)=>{
+      // sort by billDate descending, then createdAt descending
+      const da = a.billDate||"", db = b.billDate||"";
+      if(db!==da) return db.localeCompare(da);
+      return b.createdAt - a.createdAt;
+    });
+
+  // Index of current bill within focusBills (for prev/next nav)
+  const activeBillIdx = focusBills.findIndex(b=>b.id===activeBillId);
+
+  if(!loaded) return <div style={{display:"flex",height:"100vh",alignItems:"center",justifyContent:"center",background:"#f0f2f5"}}><p style={{color:"#888",fontSize:16}}>Loading…</p></div>;
+
+  // ── navigation helpers ──
+  const goToEntry = (billId, tab="add") => {
+    setActiveBillId(billId);
+    setEntryForm({...EMPTY_ENTRY,date:todayStr()});
+    setEditEntryId(null);
+    setEntryTab(tab);
+    setShowActions(false);
+    setScreen("entry");
+  };
+
+  // FIX 1: Always show billList screen when opening a party
+  const openParty = (party) => {
+    setFocusPartyId(party.id);
+    setNewBillForm({billNo:"",billDate:todayStr()});
+    setShowNewBill(false);
+    setScreen("billList");
+  };
+
+  // normalize bill number: strip leading zeros so "02" === "2"
+  const normBillNo = (n) => String(Number(n.trim())||n.trim()).toLowerCase();
+
+  // FIX 2: Duplicate bill number check (numeric-aware: 02 === 2)
+  const isDupeBillNo = (billNo) => {
+    if(!billNo.trim()) return false;
+    const norm = normBillNo(billNo);
+    return (bills||[]).some(b => b.partyId===focusPartyId && normBillNo(b.billNo)===norm);
+  };
+
+  const createBill = () => {
+    if(!newBillForm.billNo.trim()) return;
+    if(isDupeBillNo(newBillForm.billNo)) return; // blocked by warning UI
+    const bill={id:uid(),partyId:focusPartyId,billNo:newBillForm.billNo.trim(),billDate:newBillForm.billDate,createdAt:Date.now(),entries:[]};
+    setBills(prev=>[bill,...prev]);
+    setShowNewBill(false);
+    goToEntry(bill.id);
+  };
+
+  // ── entry CRUD ──
+  const saveEntry = () => {
+    if(!entryForm.awb.trim()||!entryForm.destination.trim()) return;
+    if(editEntryId){
+      setBills(prev=>prev.map(b=>b.id===activeBillId
+        ?{...b,entries:b.entries.map(e=>e.id===editEntryId?{...entryForm,id:editEntryId}:e)}
+        :b));
+      setSavedFlash("✓ Entry updated!");
+    } else {
+      setBills(prev=>prev.map(b=>b.id===activeBillId
+        ?{...b,entries:[...b.entries,{...entryForm,id:uid()}]}
+        :b));
+      setSavedFlash("✓ Entry saved!");
+    }
+    setEntryForm({...EMPTY_ENTRY,date:entryForm.date,mode:entryForm.mode});
+    setEditEntryId(null);
+    setTimeout(()=>setSavedFlash(""),1800);
+  };
+
+  const startEditEntry = (e) => {
+    setEntryForm({...e});
+    setEditEntryId(e.id);
+    setEntryTab("add");
+  };
+
+  const cancelEdit = () => {
+    setEntryForm({...EMPTY_ENTRY,date:todayStr()});
+    setEditEntryId(null);
+  };
+
+  const deleteEntry = (eid) => {
+    const e = activeEntries.find(x=>x.id===eid);
+    setConfirmDelete({type:"entry", id:eid, label:`Delete entry: AWB ${e?.awb||eid}?`, sub:"This cannot be undone."});
+  };
+
+  const deleteBill = (billId) => {
+    const bill = (bills||[]).find(b=>b.id===billId);
+    if(!bill) return;
+    setConfirmDelete({
+      type:"bill", id:billId,
+      label:`Delete Bill #${bill.billNo}?`,
+      sub:`This will permanently remove all ${bill.entries.length} entr${bill.entries.length===1?"y":"ies"} inside it.`
+    });
+  };
+
+  const confirmDeleteAction = () => {
+    if(!confirmDelete) return;
+    if(confirmDelete.type==="entry"){
+      setBills(prev=>prev.map(b=>b.id===activeBillId?{...b,entries:b.entries.filter(e=>e.id!==confirmDelete.id)}:b));
+      if(editEntryId===confirmDelete.id) cancelEdit();
+    } else if(confirmDelete.type==="bill"){
+      setBills(prev=>prev.filter(b=>b.id!==confirmDelete.id));
+      if(activeBillId===confirmDelete.id){ setActiveBillId(null); setScreen("billList"); }
+    }
+    setConfirmDelete(null);
+  };
+
+  // FIX 3: AWB duplicate check (within current bill, excluding current edit)
+  const isDupeAWB = (awb) => {
+    if(!awb.trim()) return false;
+    return activeEntries.some(e => e.awb.trim()===awb.trim() && e.id!==editEntryId);
+  };
+  // AWB / Bill No / Weight must not be zero
+  const isZeroAWB  = (awb) => awb.trim()!=="" && Number(awb)===0;
+  const isZeroKg   = (kg)  => kg!=="" && Number(kg)===0;
+
+  const saveParty  = (u) => {
+    // duplicate name check when editing (case-insensitive, exclude self)
+    const isDupePartyName = (parties||[]).some(p => p.id!==u.id && p.name.trim().toLowerCase()===u.name.trim().toLowerCase());
+    if(isDupePartyName) return false;
+    setParties(prev=>prev.map(p=>p.id===u.id?u:p)); setEditPartyId(null); return true;
+  };
+  const addParty   = () => {
+    setNewPartyName("");
+    setShowAddParty(true);
+  };
+  const confirmAddParty = () => {
+    const name = newPartyName.trim();
+    if(!name) return;
+    const isDupe = (parties||[]).some(p=>p.name.trim().toLowerCase()===name.toLowerCase());
+    if(isDupe) return;
+    setParties(prev=>[...prev,{id:uid(),name,address:"",gstin:"",phone:"",fuelPct:15,cgstPct:9,sgstPct:9}]);
+    setShowAddParty(false);
+    setNewPartyName("");
+  };
+
+  // ── Global in-app confirmation modal ─────────────────────────────────────
+  const ConfirmModal = confirmDelete ? (
+    <div style={S.overlay}>
+      <div style={S.modal}>
+        <div style={{textAlign:"center",fontSize:36,marginBottom:4}}>🗑️</div>
+        <p style={{...S.modalTitle,textAlign:"center",color:"#cc3333"}}>{confirmDelete.label}</p>
+        {confirmDelete.sub && <p style={{fontSize:13,color:"#888",textAlign:"center",margin:0}}>{confirmDelete.sub}</p>}
+        <div style={{display:"flex",gap:8,marginTop:8}}>
+          <button style={{...S.primaryBtn,flex:1,background:"#cc3333"}} onClick={confirmDeleteAction}>
+            Yes, Delete
+          </button>
+          <button style={{...S.ghostBtn,flex:1}} onClick={()=>setConfirmDelete(null)}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOME
+  // ══════════════════════════════════════════════════════════════════════════
+  if(screen==="home"){
+    return(
+      <div style={S.root}>
+        {ConfirmModal}
+        <div style={S.topBar}>
+          <span style={{...S.brand,flex:1}}>JSS Air Express</span>
+          <Pill label="Bills"   onClick={()=>setScreen("allBills")}/>
+          <Pill label="Parties" onClick={()=>setScreen("parties")}/>
+        </div>
+        <div style={S.body}>
+          <p style={S.sectionLabel}>Select Party</p>
+          {(parties||[]).map(party=>{
+            const pb=(bills||[]).filter(b=>b.partyId===party.id);
+            const tot=pb.reduce((s,b)=>s+b.entries.length,0);
+            return(
+              <button key={party.id} style={S.partyCard} onClick={()=>openParty(party)}>
+                <div style={S.partyLeft}>
+                  <span style={S.partyName}>{party.name}</span>
+                  <span style={pb.length?S.badgeGreen:S.badgeGray}>
+                    {pb.length ? pb.length+" bill"+(pb.length>1?"s":"")+" · "+tot+" entr"+(tot===1?"y":"ies") : "No bills yet"}
+                  </span>
+                </div>
+                <span style={S.chevron}>›</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // BILL LIST (for a party) — FIX 1: always shown, never skipped
+  // ══════════════════════════════════════════════════════════════════════════
+  if(screen==="billList"){
+    const dupeBillNo   = isDupeBillNo(newBillForm.billNo);
+    const zeroBillNo   = newBillForm.billNo.trim()!=="" && Number(newBillForm.billNo)===0;
+    const billNoBlocked = !newBillForm.billNo.trim() || dupeBillNo || zeroBillNo;
+    return(
+      <div style={S.root}>
+        {ConfirmModal}
+        <div style={S.topBar}>
+          <button style={S.backBtn} onClick={()=>{setShowNewBill(false);setScreen("home");}}>← Back</button>
+          <span style={{...S.brand,flex:1}}>{focusParty?.name}</span>
+          <Pill label="+ New Bill" onClick={()=>{ setNewBillForm({billNo:"",billDate:todayStr()}); setShowNewBill(true); }}/>
+        </div>
+
+        {showNewBill&&(
+          <div style={S.overlay}>
+            <div style={S.modal}>
+              <p style={S.modalTitle}>New Bill — {focusParty?.name}</p>
+              <Field label="Bill Number *">
+                <input style={{...S.input,...((dupeBillNo||zeroBillNo)?S.inputWarn:{})}}
+                  placeholder="e.g. 101" value={newBillForm.billNo}
+                  onChange={e=>setNewBillForm(p=>({...p,billNo:e.target.value}))}/>
+                {dupeBillNo && <div style={S.warnMsg}>⚠️ Bill number already in use for this party</div>}
+                {zeroBillNo && !dupeBillNo && <div style={S.warnMsg}>⚠️ Bill number cannot be zero</div>}
+              </Field>
+              <Field label="Bill Date">
+                <input style={S.input} type="date" value={newBillForm.billDate}
+                  onChange={e=>setNewBillForm(p=>({...p,billDate:e.target.value}))}/>
+              </Field>
+              <div style={{display:"flex",gap:8,marginTop:4}}>
+                <button style={{...S.primaryBtn,flex:1,...(billNoBlocked?S.disabled:{})}}
+                  onClick={createBill} disabled={billNoBlocked}>
+                  Create Bill
+                </button>
+                <button style={{...S.ghostBtn,flex:1}} onClick={()=>setShowNewBill(false)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div style={S.body}>
+          {focusBills.length===0
+            ? <Empty icon="📄" text="No bills yet" hint='Tap "+ New Bill" to create one'/>
+            : focusBills.map(b=>{
+                const tot=b.entries.reduce((s,e)=>s+Number(e.price||0),0);
+                const mk=monthOf(b.billDate);
+                return(
+                  <div key={b.id} style={{...S.billCard,gap:0,flexDirection:"column",alignItems:"stretch",padding:0,overflow:"hidden"}}>
+                    <button style={{...S.billCard,border:"none",borderRadius:0,boxShadow:"none",margin:0,padding:"14px"}}
+                      onClick={()=>goToEntry(b.id,"list")}>
+                      <div style={S.partyLeft}>
+                        <span style={S.partyName}>Bill #{b.billNo}</span>
+                        <span style={S.badgeGray}>{monthLabel(mk)} · {b.entries.length} entries</span>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{fontWeight:700,color:"#1a6b3a",fontSize:15}}>₹{fmtINR(tot)}</span>
+                        <span style={S.chevron}>›</span>
+                      </div>
+                    </button>
+                    <div style={{borderTop:"1px solid #f0f0f0",padding:"8px 14px",display:"flex",justifyContent:"flex-end"}}>
+                      <button style={S.deleteBillBtn} onClick={(e)=>{e.stopPropagation();deleteBill(b.id);}}>
+                        🗑 Delete Bill
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+          }
+        </div>
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ENTRY SCREEN — FIX 1: prev/next bill navigation added
+  // ══════════════════════════════════════════════════════════════════════════
+  if(screen==="entry"&&activeBill){
+    // prev/next in sorted focusBills array
+    const hasPrev = activeBillIdx > 0;
+    const hasNext = activeBillIdx < focusBills.length - 1;
+
+    const goToBill = (idx) => {
+      if(idx < 0 || idx >= focusBills.length) return;
+      cancelEdit();
+      setActiveBillId(focusBills[idx].id);
+      setEntryTab("list");
+      setShowActions(false);
+    };
+
+    // FIX 3: live AWB dupe check
+    const awbDupe  = isDupeAWB(entryForm.awb);
+    const awbZero  = isZeroAWB(entryForm.awb);
+    const kgZero   = isZeroKg(entryForm.kg);
+    const billNoZero = (newBillForm.billNo.trim()!=="" && Number(newBillForm.billNo)===0);
+
+    return(
+      <div style={S.root}>
+        {ConfirmModal}
+        <div style={{...S.topBar,position:"relative",zIndex:20}}>
+          <button style={S.backBtn} onClick={()=>{setShowActions(false);cancelEdit();setScreen("billList");}}>← Back</button>
+          <div style={{flex:1}}>
+            <div style={S.brand}>{activeParty?.name}</div>
+            <div style={{fontSize:11,color:"#a8d0f0",marginTop:1}}>Bill #{activeBill.billNo} · {monthLabel(monthOf(activeBill.billDate))}</div>
+          </div>
+          <Pill label="⋯" onClick={()=>setShowActions(v=>!v)}/>
+        </div>
+
+        {showActions&&<div style={S.actionsBg} onClick={()=>setShowActions(false)}/>}
+        {showActions&&(
+          <div style={S.actionsMenu}>
+            <button style={S.actionItem} onClick={()=>{exportExcel(activeParty,activeBill,activeEntries);setShowActions(false);}}>
+              📊 Download Excel
+            </button>
+            <div style={S.actionDivider}/>
+            <button style={S.actionItem} onClick={()=>{downloadPDF(activeParty,activeBill,activeEntries);setShowActions(false);}}>
+              📄 Download PDF
+            </button>
+            <div style={S.actionDivider}/>
+            <button style={S.actionItem} onClick={()=>{setShowActions(false);sharePDF(activeParty,activeBill,activeEntries,setShareStatus);}}>
+              📤 Share Bill
+            </button>
+            <div style={S.actionDivider}/>
+            <button style={{...S.actionItem,color:"#cc3333"}} onClick={()=>{setShowActions(false);deleteBill(activeBillId);}}>
+              🗑 Delete This Bill
+            </button>
+          </div>
+        )}
+
+        {shareStatus==="tip"&&(
+          <div style={S.tipBar}>📄 Opened in browser — tap Share or Print to send as PDF</div>
+        )}
+
+        <div style={S.strip}>
+          <Strip label="Entries"   value={activeEntries.length}/>
+          <Strip label="Gross"     value={"₹"+fmtINR(totals.gross)}/>
+          <Strip label="Net w/Tax" value={"₹"+fmtINR(totals.net.toFixed(0))}/>
+        </div>
+
+        {/* FIX 1: Bill navigation bar — shown only when party has multiple bills */}
+        {focusBills.length > 1 && (
+          <div style={S.billNav}>
+            <button
+              style={{...S.billNavBtn,...(!hasPrev?S.billNavBtnDis:{})}}
+              disabled={!hasPrev}
+              onClick={()=>goToBill(activeBillIdx-1)}
+            >‹ Newer</button>
+            <span style={S.billNavInfo}>
+              Bill {activeBillIdx+1} of {focusBills.length}
+            </span>
+            <button
+              style={{...S.billNavBtn,...(!hasNext?S.billNavBtnDis:{})}}
+              disabled={!hasNext}
+              onClick={()=>goToBill(activeBillIdx+1)}
+            >Older ›</button>
+          </div>
+        )}
+
+        <div style={S.tabs}>
+          <Tab label={editEntryId?"✏️ Editing":"Add Entry"} active={entryTab==="add"} onClick={()=>setEntryTab("add")}/>
+          <Tab label={"Entries ("+activeEntries.length+")"} active={entryTab==="list"} onClick={()=>setEntryTab("list")}/>
+        </div>
+
+        <div style={S.body}>
+          {entryTab==="add"&&(
+            <>
+              {editEntryId&&(
+                <div style={{background:"#fff3cd",borderRadius:8,padding:"8px 12px",fontSize:13,color:"#856404",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span>✏️ Editing entry</span>
+                  <button style={{background:"transparent",border:"none",color:"#856404",cursor:"pointer",fontWeight:700}} onClick={cancelEdit}>Cancel</button>
+                </div>
+              )}
+              <div style={S.card}>
+                <Field label="Date">
+                  <input style={S.input} type="date" value={entryForm.date}
+                    onChange={e=>setEntryForm(p=>({...p,date:e.target.value}))}/>
+                </Field>
+
+                <Field label="AWB Number *">
+                  <input style={{...S.input,...((awbDupe||awbZero)?S.inputWarn:{})}}
+                    placeholder="e.g. 1823432" value={entryForm.awb}
+                    onChange={e=>setEntryForm(p=>({...p,awb:e.target.value}))}/>
+                  {awbDupe && <div style={S.warnMsg}>⚠️ AWB number already used in this bill</div>}
+                  {awbZero && !awbDupe && <div style={S.warnMsg}>⚠️ AWB number cannot be zero</div>}
+                </Field>
+
+                {/* FIX 4: weight min=0, clamp on change, warn if zero */}
+                <Field label="Weight (KG)">
+                  <input style={{...S.input,...(kgZero?S.inputWarn:{})}} type="number" placeholder="e.g. 1.5"
+                    min="0" step="0.5"
+                    value={entryForm.kg}
+                    onChange={e=>{
+                      const val = e.target.value;
+                      if(val !== "" && Number(val) < 0) return;
+                      setEntryForm(p=>({...p,kg:val}));
+                    }}/>
+                  {kgZero && <div style={S.warnMsg}>⚠️ Weight cannot be zero</div>}
+                </Field>
+
+                <Field label="Mode">
+                  <div style={{display:"flex",gap:8}}>
+                    {MODES.map(m=><button key={m} style={{...S.modeBtn,...(entryForm.mode===m?S.modeBtnOn:{})}} onClick={()=>setEntryForm(p=>({...p,mode:m}))}>{m}</button>)}
+                  </div>
+                </Field>
+
+                <Field label="Destination *">
+                  <input style={S.input} placeholder="e.g. CHENNAI" value={entryForm.destination}
+                    onChange={e=>setEntryForm(p=>({...p,destination:e.target.value.toUpperCase()}))}/>
+                </Field>
+
+                {/* FIX 4: client name auto-capitalize first letter */}
+                <Field label="Client Name">
+                  <input style={S.input} placeholder="e.g. Ratan" value={entryForm.clientName}
+                    onChange={e=>setEntryForm(p=>({...p,clientName:capitalizeFirst(e.target.value)}))}/>
+                </Field>
+
+                <Field label="Price (₹)">
+                  <input style={S.input} type="number" placeholder="e.g. 75" value={entryForm.price}
+                    onChange={e=>setEntryForm(p=>({...p,price:e.target.value}))}/>
+                </Field>
+              </div>
+
+              {savedFlash&&<div style={S.flash}>{savedFlash}</div>}
+
+              <button
+                style={{...S.primaryBtn,...((!entryForm.awb.trim()||!entryForm.destination.trim()||awbDupe||awbZero||kgZero)?S.disabled:{})}}
+                disabled={!entryForm.awb.trim()||!entryForm.destination.trim()||awbDupe||awbZero||kgZero}
+                onClick={saveEntry}>
+                {editEntryId ? "✏️ Update Entry" : "+ Save Entry"}
+              </button>
+            </>
+          )}
+
+          {entryTab==="list"&&(
+            <>
+              {activeEntries.length===0
+                ?<Empty icon="📦" text="No entries yet" hint="Switch to Add Entry tab"/>
+                :activeEntries.map((e,i)=>(
+                  <div key={e.id} style={S.eCard}>
+                    <div style={S.eTop}>
+                      <span style={S.eNo}>#{i+1}</span>
+                      <span style={S.eDest}>{e.destination}</span>
+                      <span style={S.eAmt}>{e.price?"₹"+fmtINR(e.price):"—"}</span>
+                      <button style={S.editIconBtn} title="Edit" onClick={()=>{startEditEntry(e);setEntryTab("add");}}>✏️</button>
+                      <button style={S.del} title="Delete" onClick={()=>deleteEntry(e.id)}>✕</button>
+                    </div>
+                    <div style={S.eMeta}>
+                      {e.date&&<span>{fmtDate(e.date)}</span>}
+                      <span>AWB: {e.awb}</span>
+                      {e.kg&&<span>{e.kg} kg</span>}
+                      <span>{e.mode}</span>
+                      {e.clientName&&<span>{e.clientName}</span>}
+                    </div>
+                  </div>
+                ))
+              }
+              {activeEntries.length>0&&(
+                <div style={{display:"flex",flexDirection:"column",gap:8,marginTop:4}}>
+                  <button style={{...S.primaryBtn,background:"#1a6b3a"}} onClick={()=>exportExcel(activeParty,activeBill,activeEntries)}>
+                    📊 Download Excel
+                  </button>
+                  <button style={{...S.primaryBtn,background:"#c0392b"}} onClick={()=>downloadPDF(activeParty,activeBill,activeEntries)}>
+                    📄 Download PDF
+                  </button>
+                  <button style={{...S.primaryBtn,background:"#7c3aed"}} onClick={()=>sharePDF(activeParty,activeBill,activeEntries,setShareStatus)}>
+                    📤 Share Bill
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // ALL BILLS
+  // ══════════════════════════════════════════════════════════════════════════
+  if(screen==="allBills"){
+    const grouped={};
+    [...(bills||[])].sort((a,b)=>b.createdAt-a.createdAt).forEach(b=>{
+      const mk=monthOf(b.billDate); if(!grouped[mk]) grouped[mk]=[]; grouped[mk].push(b);
+    });
+    return(
+      <div style={S.root}>
+        <div style={S.topBar}>
+          <button style={S.backBtn} onClick={()=>setScreen("home")}>← Back</button>
+          <span style={{...S.brand,flex:1}}>All Bills</span>
+        </div>
+        <div style={S.body}>
+          {Object.keys(grouped).length===0
+            ?<Empty icon="🗂️" text="No bills yet" hint="Select a party on home screen"/>
+            :Object.entries(grouped).map(([mk,mBills])=>(
+              <div key={mk}>
+                <p style={S.groupLabel}>{monthLabel(mk)}</p>
+                {mBills.map(b=>{
+                  const party=parties?.find(p=>p.id===b.partyId);
+                  const tot=b.entries.reduce((s,e)=>s+Number(e.price||0),0);
+                  return(
+                    <button key={b.id} style={{...S.billCard,marginBottom:8}}
+                      onClick={()=>{setFocusPartyId(b.partyId); goToEntry(b.id,"list");}}>
+                      <div style={S.partyLeft}>
+                        <span style={S.partyName}>{party?.name||"Unknown"}</span>
+                        <span style={S.badgeGray}>Bill #{b.billNo} · {b.entries.length} entries</span>
+                      </div>
+                      <div style={{display:"flex",alignItems:"center",gap:6}}>
+                        <span style={{fontWeight:700,color:"#1a6b3a",fontSize:15}}>₹{fmtINR(tot)}</span>
+                        <span style={S.chevron}>›</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // PARTIES
+  // ══════════════════════════════════════════════════════════════════════════
+  if(screen==="parties"){
+    const dupeNewPartyName = newPartyName.trim()!=="" &&
+      (parties||[]).some(p=>p.name.trim().toLowerCase()===newPartyName.trim().toLowerCase());
+    return(
+      <div style={S.root}>
+        <div style={S.topBar}>
+          <button style={S.backBtn} onClick={()=>setScreen("home")}>← Back</button>
+          <span style={{...S.brand,flex:1}}>Manage Parties</span>
+          <Pill label="+ Add Party" onClick={addParty}/>
+        </div>
+
+        {/* In-app Add Party modal */}
+        {showAddParty&&(
+          <div style={S.overlay}>
+            <div style={S.modal}>
+              <p style={S.modalTitle}>Add New Party</p>
+              <Field label="Party Name *">
+                <input style={{...S.input,...(dupeNewPartyName?S.inputWarn:{})}}
+                  placeholder="e.g. ABC Traders"
+                  value={newPartyName}
+                  autoFocus
+                  onChange={e=>setNewPartyName(capitalizeFirst(e.target.value))}
+                  onKeyDown={e=>{ if(e.key==="Enter"&&!dupeNewPartyName&&newPartyName.trim()) confirmAddParty(); }}
+                />
+                {dupeNewPartyName && <div style={S.warnMsg}>⚠️ A party with this name already exists</div>}
+              </Field>
+              <div style={{display:"flex",gap:8,marginTop:4}}>
+                <button
+                  style={{...S.primaryBtn,flex:1,...((!newPartyName.trim()||dupeNewPartyName)?S.disabled:{})}}
+                  disabled={!newPartyName.trim()||dupeNewPartyName}
+                  onClick={confirmAddParty}>
+                  Add Party
+                </button>
+                <button style={{...S.ghostBtn,flex:1}} onClick={()=>{setShowAddParty(false);setNewPartyName("");}}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div style={S.body}>
+          <p style={S.sectionLabel}>{(parties||[]).length} parties</p>
+          {(parties||[]).map(party=>(
+            editPartyId===party.id
+              ?<PartyEditor key={party.id} party={party} parties={parties} onSave={saveParty} onCancel={()=>setEditPartyId(null)}/>
+              :(
+                <div key={party.id} style={{...S.billCard,flexDirection:"column",alignItems:"flex-start",gap:4,marginBottom:8}}>
+                  <div style={{display:"flex",width:"100%",alignItems:"center"}}>
+                    <span style={{...S.partyName,flex:1}}>{party.name}</span>
+                    <button style={S.editBtn} onClick={()=>setEditPartyId(party.id)}>Edit</button>
+                  </div>
+                  <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                    <span style={{...S.badgeGray,background:"#f0f4ff",borderRadius:5,padding:"2px 7px",color:"#1a3a5c",fontWeight:600}}>
+                      Fuel: {party.fuelPct}%
+                    </span>
+                    <span style={{...S.badgeGray,background:"#f0f4ff",borderRadius:5,padding:"2px 7px",color:"#1a3a5c",fontWeight:600}}>
+                      CGST: {party.cgstPct}% · SGST: {party.sgstPct}%
+                    </span>
+                  </div>
+                  {party.address&&<span style={S.badgeGray}>{party.address}</span>}
+                  {party.gstin&&<span style={S.badgeGray}>GSTIN: {party.gstin}</span>}
+                  {party.phone&&<span style={S.badgeGray}>Ph: {party.phone}</span>}
+                </div>
+              )
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+// ── Sub-components ────────────────────────────────────────────────────────────
+function Field({label,children}){
+  return <div style={{display:"flex",flexDirection:"column",gap:4}}><label style={S.label}>{label}</label>{children}</div>;
+}
+function Pill({label,onClick}){
+  return <button style={S.pill} onClick={onClick}>{label}</button>;
+}
+function Tab({label,active,onClick}){
+  return <button style={{...S.tabBtn,...(active?S.tabActive:{})}} onClick={onClick}>{label}</button>;
+}
+function Strip({label,value}){
+  return <div style={S.stripItem}><span style={S.stripLabel}>{label}</span><span style={S.stripValue}>{value}</span></div>;
+}
+function Empty({icon,text,hint}){
+  return(
+    <div style={{textAlign:"center",paddingTop:60,color:"#999"}}>
+      <div style={{fontSize:38}}>{icon}</div>
+      <div style={{fontWeight:600,marginTop:10,color:"#555",fontSize:15}}>{text}</div>
+      {hint&&<div style={{fontSize:13,marginTop:5}}>{hint}</div>}
+    </div>
+  );
+}
+function PartyEditor({party,parties,onSave,onCancel}){
+  const [f,setF]=useState({...party});
+  const [saveErr,setSaveErr]=useState("");
+  const h=k=>e=>setF(p=>({...p,[k]:e.target.value}));
+  const hn=k=>e=>setF(p=>({...p,[k]:Math.max(0,Number(e.target.value))}));
+  const dupeEditName = f.name.trim()!=="" &&
+    (parties||[]).some(p=>p.id!==party.id && p.name.trim().toLowerCase()===f.name.trim().toLowerCase());
+  const handleSave = () => {
+    if(dupeEditName){ setSaveErr("A party with this name already exists"); return; }
+    const ok = onSave(f);
+    if(ok===false) setSaveErr("A party with this name already exists");
+  };
+  return(
+    <div style={{...S.card,marginBottom:8,border:"2px solid #1a3a5c"}}>
+      <p style={{fontWeight:700,color:"#1a3a5c",fontSize:14,margin:0}}>✏️ Editing: {party.name}</p>
+      <Field label="Party Name">
+        <input style={{...S.input,...(dupeEditName?S.inputWarn:{})}} value={f.name} onChange={h("name")}/>
+        {dupeEditName && <div style={S.warnMsg}>⚠️ A party with this name already exists</div>}
+      </Field>
+      <Field label="Address"><input style={S.input} value={f.address} onChange={h("address")} placeholder="Optional"/></Field>
+      <Field label="GSTIN"><input style={S.input} value={f.gstin} onChange={h("gstin")} placeholder="Optional"/></Field>
+      <Field label="Phone"><input style={S.input} value={f.phone} onChange={h("phone")} placeholder="Optional" type="tel"/></Field>
+      <div style={{background:"#f0f4ff",borderRadius:8,padding:"10px 12px",display:"flex",flexDirection:"column",gap:10}}>
+        <p style={{fontSize:11,fontWeight:700,color:"#1a3a5c",textTransform:"uppercase",letterSpacing:"0.5px",margin:0}}>Tax & Charges</p>
+        <Field label="Fuel Charge %  (0 = no fuel charge)">
+          <input style={S.input} type="number" min="0" max="100" step="0.5" value={f.fuelPct} onChange={hn("fuelPct")}/>
+        </Field>
+        <div style={{display:"flex",gap:8}}>
+          <div style={{flex:1}}><Field label="CGST %"><input style={S.input} type="number" min="0" max="50" step="0.5" value={f.cgstPct} onChange={hn("cgstPct")}/></Field></div>
+          <div style={{flex:1}}><Field label="SGST %"><input style={S.input} type="number" min="0" max="50" step="0.5" value={f.sgstPct} onChange={hn("sgstPct")}/></Field></div>
+        </div>
+        <p style={{fontSize:11,color:"#555",margin:0}}>
+          Preview: Gross ₹1000 → Net ₹{(1000*(1+f.fuelPct/100)*(1+f.cgstPct/100+f.sgstPct/100)).toFixed(0)}
+        </p>
+      </div>
+      {saveErr&&<div style={S.warnMsg}>{saveErr}</div>}
+      <div style={{display:"flex",gap:8}}>
+        <button style={{...S.primaryBtn,flex:1,...(dupeEditName?S.disabled:{})}} disabled={dupeEditName} onClick={handleSave}>Save Party</button>
+        <button style={{...S.ghostBtn,flex:1}} onClick={onCancel}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+const S={
+  root:        {fontFamily:"'Segoe UI',Arial,sans-serif",background:"#f0f2f5",minHeight:"100vh",maxWidth:430,margin:"0 auto",display:"flex",flexDirection:"column",fontSize:15,color:"#1a1a2e"},
+  topBar:      {background:"#1a3a5c",color:"#fff",padding:"14px 16px",display:"flex",alignItems:"center",gap:8,flexShrink:0},
+  brand:       {fontWeight:700,fontSize:16},
+  backBtn:     {background:"transparent",border:"none",color:"#a8d0f0",fontSize:14,cursor:"pointer",padding:0,whiteSpace:"nowrap"},
+  pill:        {background:"rgba(255,255,255,0.18)",border:"none",color:"#fff",borderRadius:7,padding:"6px 11px",fontSize:13,fontWeight:600,cursor:"pointer",whiteSpace:"nowrap"},
+  body:        {flex:1,padding:14,display:"flex",flexDirection:"column",gap:10,overflowY:"auto"},
+  sectionLabel:{fontSize:12,fontWeight:700,color:"#888",textTransform:"uppercase",letterSpacing:"0.6px",margin:0},
+  groupLabel:  {fontSize:12,fontWeight:700,color:"#888",textTransform:"uppercase",letterSpacing:"0.6px",margin:"8px 0 4px"},
+  actionsBg:   {position:"fixed",inset:0,zIndex:25,background:"transparent"},
+  actionsMenu: {position:"fixed",top:58,right:12,background:"#fff",borderRadius:12,boxShadow:"0 4px 24px rgba(0,0,0,0.18)",zIndex:30,minWidth:220,overflow:"hidden"},
+  actionItem:  {width:"100%",background:"transparent",border:"none",padding:"14px 16px",fontSize:15,fontWeight:500,color:"#1a1a2e",cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",gap:10},
+  actionDivider:{height:1,background:"#f0f0f0",margin:"0 12px"},
+  tipBar:      {background:"#7c3aed",color:"#fff",padding:"10px 16px",fontSize:13,fontWeight:500,textAlign:"center",flexShrink:0},
+  partyCard:   {background:"#fff",border:"1.5px solid #e0e4ec",borderRadius:12,padding:"15px 14px",display:"flex",alignItems:"center",cursor:"pointer",textAlign:"left",boxShadow:"0 1px 3px rgba(0,0,0,0.06)",width:"100%",boxSizing:"border-box"},
+  partyLeft:   {flex:1,display:"flex",flexDirection:"column",gap:3},
+  partyName:   {fontWeight:700,fontSize:16,color:"#1a3a5c"},
+  badgeGreen:  {fontSize:12,color:"#1a7a3a",fontWeight:600},
+  badgeGray:   {fontSize:12,color:"#888"},
+  chevron:     {fontSize:22,color:"#bbb",marginLeft:6},
+  overlay:     {position:"fixed",inset:0,background:"rgba(0,0,0,0.45)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:20},
+  modal:       {background:"#fff",borderRadius:14,padding:20,width:"100%",maxWidth:370,display:"flex",flexDirection:"column",gap:12},
+  modalTitle:  {fontWeight:700,fontSize:16,color:"#1a3a5c",margin:0},
+  strip:       {background:"#1a3a5c",display:"flex",padding:"10px 14px",flexShrink:0},
+  stripItem:   {flex:1,display:"flex",flexDirection:"column",alignItems:"center"},
+  stripLabel:  {fontSize:10,color:"#89aecb",fontWeight:600,textTransform:"uppercase",letterSpacing:"0.4px"},
+  stripValue:  {fontSize:14,fontWeight:700,color:"#fff",marginTop:2},
+  // FIX 1: bill navigation bar styles
+  billNav:     {background:"#eef2f8",borderBottom:"1px solid #d0d8e8",display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 14px",flexShrink:0},
+  billNavBtn:  {background:"#1a3a5c",color:"#fff",border:"none",borderRadius:7,padding:"6px 14px",fontSize:13,fontWeight:600,cursor:"pointer"},
+  billNavBtnDis:{background:"#c8d0dc",color:"#fff",border:"none",borderRadius:7,padding:"6px 14px",fontSize:13,fontWeight:600,cursor:"not-allowed"},
+  billNavInfo: {fontSize:13,fontWeight:600,color:"#1a3a5c"},
+  tabs:        {display:"flex",background:"#fff",borderBottom:"1.5px solid #e0e4ec",flexShrink:0},
+  tabBtn:      {flex:1,padding:"11px 0",background:"transparent",border:"none",fontSize:14,fontWeight:500,color:"#888",cursor:"pointer",borderBottom:"2.5px solid transparent"},
+  tabActive:   {color:"#1a3a5c",borderBottom:"2.5px solid #1a3a5c",fontWeight:700},
+  card:        {background:"#fff",borderRadius:12,padding:14,display:"flex",flexDirection:"column",gap:13,boxShadow:"0 1px 4px rgba(0,0,0,0.07)"},
+  label:       {fontSize:11,fontWeight:700,color:"#666",textTransform:"uppercase",letterSpacing:"0.5px"},
+  input:       {border:"1.5px solid #dde1eb",borderRadius:8,padding:"10px 12px",fontSize:15,color:"#1a1a2e",outline:"none",background:"#f8f9fc",width:"100%",boxSizing:"border-box"},
+  // FIX 2 & 3: warning input border + message
+  inputWarn:   {borderColor:"#d97706",background:"#fffbf2"},
+  warnMsg:     {fontSize:12,color:"#b45309",fontWeight:600,marginTop:2},
+  modeBtn:     {flex:1,border:"1.5px solid #dde1eb",borderRadius:8,padding:"10px 0",background:"#f8f9fc",color:"#555",fontWeight:600,fontSize:13,cursor:"pointer"},
+  modeBtnOn:   {background:"#1a3a5c",color:"#fff",borderColor:"#1a3a5c"},
+  primaryBtn:  {background:"#1a3a5c",color:"#fff",border:"none",borderRadius:10,padding:14,fontSize:15,fontWeight:700,cursor:"pointer",width:"100%"},
+  ghostBtn:    {background:"#f0f2f5",color:"#555",border:"1.5px solid #dde1eb",borderRadius:10,padding:14,fontSize:15,fontWeight:600,cursor:"pointer",width:"100%"},
+  disabled:    {opacity:0.38,cursor:"not-allowed"},
+  flash:       {background:"#e6f4ec",color:"#1a6b3a",borderRadius:8,padding:"10px 14px",fontWeight:600,fontSize:14,textAlign:"center"},
+  eCard:       {background:"#fff",borderRadius:10,padding:"12px 14px",boxShadow:"0 1px 3px rgba(0,0,0,0.07)"},
+  eTop:        {display:"flex",alignItems:"center",gap:6,marginBottom:4},
+  eNo:         {color:"#aaa",fontSize:12,fontWeight:700,minWidth:22},
+  eDest:       {flex:1,fontWeight:700,fontSize:15},
+  eAmt:        {fontWeight:700,color:"#1a6b3a",fontSize:15},
+  editIconBtn: {background:"transparent",border:"none",fontSize:15,cursor:"pointer",padding:"0 2px"},
+  del:         {background:"transparent",border:"none",color:"#cc3333",fontSize:14,cursor:"pointer",padding:"0 2px"},
+  eMeta:       {color:"#888",fontSize:12,display:"flex",gap:6,flexWrap:"wrap"},
+  billCard:    {background:"#fff",border:"1.5px solid #e0e4ec",borderRadius:12,padding:"14px",display:"flex",alignItems:"center",cursor:"pointer",textAlign:"left",width:"100%",boxSizing:"border-box",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"},
+  editBtn:     {background:"#f0f2f5",border:"1.5px solid #dde1eb",borderRadius:8,padding:"7px 14px",fontSize:13,fontWeight:600,cursor:"pointer",color:"#1a3a5c"},
+  deleteBillBtn:{background:"transparent",border:"none",color:"#cc3333",fontSize:13,fontWeight:600,cursor:"pointer",padding:"2px 4px"},
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
